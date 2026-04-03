@@ -23,7 +23,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from agents import Agent, RunConfig, Runner
+from agents import Agent, RunConfig, Runner, function_tool, trace
 from agents.mcp import MCPServer
 from agents.run_context import RunContextWrapper
 from agents.tool import FunctionTool, Tool
@@ -42,12 +42,12 @@ Available tools:
 {tool_catalog}
 
 Return a concrete, ordered plan. Each step should be actionable and reference specific tools \
-where relevant.\
+where relevant. Make sure you follow the instructions to format your output correctly, paying attention to requirements on where you place files, what you name them, and how to format your final results.\
 """
 
 _DEFAULT_EXECUTOR_INSTRUCTIONS = """\
 You are an executor agent. Your job is to carry out the plan below step by step using the \
-available tools. Follow the plan closely. If a step cannot be completed, note it and move on.\
+available tools. Follow the plan closely. If a step cannot be completed, note it and move on. Use your memory to track your progress and update it after each step so you don't perform the same step twice.\
 """
 
 
@@ -79,6 +79,9 @@ class PlannerExecutorContext:
 
     tool_catalog: str = ""
     """Human-readable summary of available tools, built before the Planner runs."""
+
+    memory: str = ""
+    """Running notes the Executor can write to track progress across turns."""
 
 
 @dataclass
@@ -120,6 +123,15 @@ def _format_tool_catalog(tools: list[Tool]) -> str:
             lines.append(f"- {name}")
     return "\n".join(lines)
 
+@function_tool
+def update_memory(
+    ctx: RunContextWrapper[PlannerExecutorContext], note: str
+) -> str:
+    """Append a note to your working memory (e.g. 'Completed step 2: found 3 files').
+    Call this after each plan step so you can track progress across turns."""
+    ctx.context.memory = (ctx.context.memory + "\n" + note).strip()
+    return "Memory updated."
+
 
 async def _enumerate_tools(
     mcp_servers: list[MCPServer],
@@ -133,7 +145,6 @@ async def _enumerate_tools(
         mcp_servers=mcp_servers,
     )
     return await temp_agent.get_all_tools(ctx)
-
 
 # ---------------------------------------------------------------------------
 # Factory
@@ -179,16 +190,20 @@ def create_planner_executor_pair(
         ctx: RunContextWrapper[PlannerExecutorContext],
         agent: Agent[PlannerExecutorContext],
     ) -> str:
+        parts = [config.executor_base_instructions]
         plan = (ctx.context.plan or "").strip()
         if plan:
-            return f"{config.executor_base_instructions}\n\n## Plan\n{plan}"
-        return config.executor_base_instructions
+            parts.append(f"## Plan\n{plan}")
+        memory = (ctx.context.memory or "").strip()
+        if memory:
+            parts.append(f"## Memory of your previous actions\n{memory}")
+        return "\n\n".join(parts)
 
     executor: Agent[PlannerExecutorContext] = Agent(
         name="executor",
         instructions=executor_instructions,
         model=config.executor_model,
-        tools=function_tools,
+        tools=[*function_tools, update_memory],
         mcp_servers=mcp_servers,
     )
 
@@ -207,6 +222,7 @@ async def run_planner_executor(
     *,
     config: PlannerExecutorConfig | None = None,
     run_config: RunConfig | None = None,
+    trace_id: str | None = None,
 ) -> Any:
     """Run the full Planner → Executor pipeline and return the executor's ``RunResult``.
 
@@ -231,7 +247,9 @@ async def run_planner_executor(
     if mcp_servers is None:
         mcp_servers = []
     if function_tools is None:
-        function_tools = []
+        function_tools = [update_memory]
+    else:
+        function_tools.append(update_memory)
 
     ctx = RunContextWrapper(context=PlannerExecutorContext(task=task))
 
@@ -249,13 +267,14 @@ async def run_planner_executor(
     )
 
     # 3. Run the Planner (single turn — it should not loop)
-    planner_result = await Runner.run(
-        planner,
-        task,
-        context=ctx.context,
-        max_turns=1,
-        run_config=run_config,
-    )
+    with trace(workflow_name="Planner + Executor", trace_id=trace_id):
+        planner_result = await Runner.run(
+            planner,
+            task,
+            context=ctx.context,
+            max_turns=1,
+            run_config=run_config,
+        )
 
     assert isinstance(planner_result.final_output, PlannerOutput), (
         f"Planner returned unexpected output type: {type(planner_result.final_output)}"
@@ -263,12 +282,13 @@ async def run_planner_executor(
     ctx.context.plan = planner_result.final_output.plan
 
     # 4. Run the Executor with the plan injected via callable instructions
-    executor_result = await Runner.run(
-        executor,
-        task,
-        context=ctx.context,
-        max_turns=config.max_executor_turns,
-        run_config=run_config,
-    )
+    with trace(workflow_name="Planner + Executor", trace_id=trace_id):
+        executor_result = await Runner.run(
+            executor,
+            task,
+            context=ctx.context,
+            max_turns=config.max_executor_turns,
+            run_config=run_config,
+        )
 
     return executor_result

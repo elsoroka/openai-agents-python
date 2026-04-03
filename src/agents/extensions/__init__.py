@@ -5,6 +5,7 @@ from .planner_executor import (
     create_planner_executor_pair,
     run_planner_executor,
 )
+import agents.extensions.planner_executor
 from .tool_output_trimmer import ToolOutputTrimmer
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "ToolOutputTrimmer",
     "create_planner_executor_pair",
     "run_planner_executor",
+    "planner_executor",
 ]

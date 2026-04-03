@@ -59,6 +59,7 @@ async def main() -> None:
                 task=task,
                 mcp_servers=[server],
                 config=config,
+                trace_id=trace_id,
             )
 
             print("=== Final output ===")
